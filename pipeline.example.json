@@ -1,0 +1,45 @@
+{
+  "name": "demo-pipeline",
+  "repo": { "path": "/path/to/local/repo" },
+  "trigger": {
+    "branches": ["main", "release/*"],
+    "tags": ["v*"]
+  },
+  "settings": {
+    "data_dir": "./data",
+    "max_concurrent_runs": 2,
+    "run_timeout": "30m"
+  },
+  "stages": [
+    {
+      "name": "build",
+      "tasks": [
+        { "name": "compile", "run": "go build ./...", "timeout": "5m" },
+        { "name": "package", "run": "tar czf app.tar.gz .", "artifacts": ["app.tar.gz"] }
+      ]
+    },
+    {
+      "name": "test",
+      "needs": ["build"],
+      "retries": 1,
+      "tasks": [
+        { "name": "unit", "run": "go test ./..." }
+      ]
+    },
+    {
+      "name": "staging",
+      "needs": ["test"],
+      "tasks": [
+        { "name": "deploy-staging", "run": "echo deploy to staging" }
+      ]
+    },
+    {
+      "name": "prod",
+      "needs": ["staging"],
+      "approval": { "timeout": "24h" },
+      "tasks": [
+        { "name": "deploy-prod", "run": "echo deploy to prod" }
+      ]
+    }
+  ]
+}
