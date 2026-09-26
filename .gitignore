@@ -1,0 +1,10 @@
+# daemon runtime state
+.pipelined/
+pipeline.json
+
+# built binaries
+/pipelined
+/pipelinectl
+
+# local/OS files
+.DS_Store

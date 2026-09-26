@@ -1,0 +1,46 @@
+{
+  "name": "example",
+  "repo": "/Users/me/my-project",
+  "concurrency": 2,
+  "run_timeout": "30m",
+  "triggers": {
+    "branches": ["main", "release/*"],
+    "tags": ["v[0-9]*"]
+  },
+  "stages": [
+    {
+      "name": "build",
+      "tasks": [
+        { "name": "compile", "shell": true, "command": "go build ./..." },
+        { "name": "unit-test", "shell": true, "command": "go test ./...", "artifacts": ["coverage.out"] }
+      ]
+    },
+    {
+      "name": "lint",
+      "group": "checks",
+      "tasks": [ { "name": "vet", "shell": true, "command": "go vet ./..." } ]
+    },
+    {
+      "name": "staticcheck",
+      "group": "checks",
+      "tasks": [ { "name": "sc", "shell": true, "command": "true", "allow_failure": true } ]
+    },
+    {
+      "name": "integration",
+      "needs": ["build", "lint", "staticcheck"],
+      "retry": 2,
+      "timeout": "10m",
+      "tasks": [ { "name": "e2e", "shell": true, "command": "go test -tags=e2e ./..." } ]
+    },
+    {
+      "name": "deploy",
+      "needs": ["integration"],
+      "approval": {
+        "required": true,
+        "approvers": ["alice", "bob"],
+        "timeout": "2h"
+      },
+      "tasks": [ { "name": "ship", "shell": true, "command": "./scripts/deploy.sh" } ]
+    }
+  ]
+}
