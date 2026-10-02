@@ -13,24 +13,82 @@ import (
 // pending downstream stages are marked canceled. Already-finished stages keep
 // their result.
 func (e *Engine) CancelRun(ctx context.Context, id, reason string) error {
+	why := reasonOr(reason, "canceled by user")
+
+	// Persist the terminal decision under the run lock before signaling the
+	// context. Any state transition that commits after this sees a terminal
+	// run, so no new stage/task can start once the cancel is accepted.
+	unlock := e.runLock(id)
 	run, err := e.st.LoadRun(ctx, id)
 	if err != nil {
+		unlock()
 		return err
 	}
 	if run.Status.IsTerminal() {
+		unlock()
 		return ErrRunActive
 	}
-	e.mu.Lock()
-	h, ok := e.active[id]
-	e.mu.Unlock()
-	if ok {
-		// The run loop observes ctx cancellation and persists the final state.
-		h.cancel()
-		return nil
+	now := time.Now()
+	for i := range run.Stages {
+		st := &run.Stages[i]
+		if st.Status.IsTerminal() {
+			continue
+		}
+		st.Status = model.StatusCanceled
+		st.Reason = why
+		st.FinishedAt = &now
+		for j := range st.Tasks {
+			if !st.Tasks[j].Status.IsTerminal() {
+				st.Tasks[j].Status = model.StatusCanceled
+				st.Tasks[j].FinishedAt = &now
+			}
+		}
+		if st.Approval != nil && st.Approval.Status == model.StatusPending {
+			st.Approval.Status = model.StatusCanceled
+			st.Approval.Comment = why
+			st.Approval.DecidedAt = &now
+		}
 	}
-	// Not currently driven by a loop (queued-but-not-loaded edge or orphaned):
-	// persist cancellation directly.
-	e.markUnfinished(ctx, run, model.StatusCanceled, model.StatusCanceled, reasonOr(reason, "canceled by user"))
+	run.Status = model.StatusCanceled
+	run.Reason = why
+	run.FinishedAt = &now
+	run.UpdatedAt = now
+	if err := e.st.SaveRun(ctx, run); err != nil {
+		unlock()
+		return err
+	}
+
+	e.mu.Lock()
+	h, active := e.active[id]
+	var ready <-chan struct{}
+	if active {
+		ready = h.ready
+	}
+	e.mu.Unlock()
+	unlock()
+
+	// Wake the approval gate (if any) and interrupt running children.
+	for i := range run.Stages {
+		if run.Stages[i].Approval != nil {
+			e.appr.Cancel(id, run.Stages[i].Name, why)
+		}
+	}
+	if active {
+		// If the run loop has not bound yet, wait for it so the signal is
+		// never lost; it exits immediately because the run is terminal.
+		if ready != nil {
+			select {
+			case <-ready:
+			case <-ctx.Done():
+			}
+		}
+		e.mu.Lock()
+		h2, stillActive := e.active[id]
+		e.mu.Unlock()
+		if stillActive {
+			h2.cancel()
+		}
+	}
 	return nil
 }
 

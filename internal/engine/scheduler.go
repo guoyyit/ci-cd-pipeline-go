@@ -113,8 +113,14 @@ func (s *scheduler) tick(ctx context.Context) (tickAction, error) {
 	}
 	s.run = run
 
+	// Plan the pass against the loaded snapshot. Every transition decided
+	// here is committed in one atomic document update together with the
+	// derived run status, so observers never see a waiting stage under a
+	// pending/running run and a concurrent cancel resolves against a single
+	// consistent document.
 	progress := false
 	waiting := false
+	var toLaunch []int
 
 	for i := range run.Stages {
 		st := &run.Stages[i]
@@ -131,38 +137,84 @@ func (s *scheduler) tick(ctx context.Context) (tickAction, error) {
 			continue
 		}
 
-		depStates := s.dependencyStates(run, st.Name)
-		switch decide(depStates) {
+		switch decide(s.dependencyStates(run, st.Name)) {
 		case depBlocked:
+			if st.Status != model.StatusWaiting {
+				progress = true
+			}
+			st.Status = model.StatusWaiting
 			waiting = true
-			continue
 		case depSkip:
-			idx := i
-			_, _ = s.eng.MutateRun(ctx, run.ID, func(r *model.Run) error {
-				s.skipStageLocked(r, idx, "upstream stage did not succeed")
-				return nil
-			})
+			s.skipStageLocked(run, i, "upstream stage did not succeed")
 			progress = true
-			continue
 		case depReady:
-			idx := i
 			s.mu.Lock()
-			s.launched[st.Name] = true
+			if !s.launched[st.Name] {
+				s.launched[st.Name] = true
+				toLaunch = append(toLaunch, i)
+				// The stage is handed to a worker this pass; until that
+				// worker records running (or approval-wait), surface it as
+				// waiting rather than a never-dispatched pending stage.
+				if st.Status == model.StatusPending {
+					st.Status = model.StatusWaiting
+				}
+			}
 			s.mu.Unlock()
-			s.eng.wg.Add(1)
-			go func() {
-				defer s.eng.wg.Done()
-				s.executeStage(ctx, run.ID, idx)
-			}()
+			waiting = true
 			progress = true
 		}
 	}
 
-	if s.allTerminal(run) {
-		_, _ = s.eng.MutateRun(ctx, run.ID, func(r *model.Run) error {
+	committed, _ := s.eng.MutateRun(ctx, run.ID, func(r *model.Run) error {
+		if r.Status.IsTerminal() {
+			return errRunTerminal
+		}
+		// Copy the planned stage statuses into the freshly locked document.
+		for i := range r.Stages {
+			planned := run.Stages[i]
+			cur := &r.Stages[i]
+			if cur.Status.IsTerminal() || cur.Status == planned.Status {
+				continue
+			}
+			if planned.Status.IsTerminal() {
+				cur.Status = planned.Status
+				cur.Reason = planned.Reason
+				cur.FinishedAt = planned.FinishedAt
+				for j := range cur.Tasks {
+					if j < len(planned.Tasks) && planned.Tasks[j].Status.IsTerminal() {
+						cur.Tasks[j].Status = planned.Tasks[j].Status
+						cur.Tasks[j].FinishedAt = planned.FinishedAt
+					}
+				}
+				continue
+			}
+			cur.Status = planned.Status
+		}
+		if s.allTerminal(r) {
 			s.finalizeRunLocked(r)
 			return nil
-		})
+		}
+		r.Status = deriveRunStatus(r)
+		r.UpdatedAt = time.Now()
+		return nil
+	})
+	if committed == nil || committed.Status.IsTerminal() {
+		// A concurrent cancel committed first: start nothing.
+		return actionDone, nil
+	}
+
+	// Workers start only after the commit; each one re-checks the persisted
+	// terminal state before running anything.
+	for _, idx := range toLaunch {
+		stageIdx := idx
+		s.eng.wg.Add(1)
+		go func() {
+			defer s.eng.wg.Done()
+			s.executeStage(ctx, run.ID, stageIdx)
+		}()
+	}
+
+	if s.allTerminal(committed) {
 		return actionDone, nil
 	}
 	if progress {
@@ -171,8 +223,6 @@ func (s *scheduler) tick(ctx context.Context) (tickAction, error) {
 	if waiting {
 		return actionWaiting, nil
 	}
-	// Nothing running, nothing waiting, but not all terminal: this should be
-	// unreachable; treat it as a failure rather than spinning forever.
 	return actionDone, fmt.Errorf("scheduler stuck for run %s", run.ID)
 }
 
@@ -185,14 +235,14 @@ const (
 )
 
 func decide(deps []model.Status) depDecision {
-	allSuccess := len(deps) > 0
 	if len(deps) == 0 {
 		return depReady
 	}
+	allSuccess := true
 	for _, d := range deps {
 		switch d {
 		case model.StatusSuccess:
-		case model.StatusPending, model.StatusRunning:
+		case model.StatusPending, model.StatusWaiting, model.StatusRunning:
 			allSuccess = false
 		default: // failed / canceled / skipped
 			return depSkip
@@ -202,6 +252,31 @@ func decide(deps []model.Status) depDecision {
 		return depReady
 	}
 	return depBlocked
+}
+
+// deriveRunStatus computes the run status from non-terminal stages:
+// any executing stage means running; otherwise any blocked-but-dispatched
+// stage means waiting; otherwise the run is still queued (pending).
+func deriveRunStatus(run *model.Run) model.Status {
+	hasWaiting, hasPending := false, false
+	for i := range run.Stages {
+		switch run.Stages[i].Status {
+		case model.StatusRunning:
+			return model.StatusRunning
+		case model.StatusWaiting:
+			hasWaiting = true
+		case model.StatusPending:
+			hasPending = true
+		}
+	}
+	switch {
+	case hasWaiting:
+		return model.StatusWaiting
+	case hasPending:
+		return model.StatusPending
+	default:
+		return model.StatusRunning
+	}
 }
 
 func (s *scheduler) dependencyStates(run *model.Run, stageName string) []model.Status {

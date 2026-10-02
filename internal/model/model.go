@@ -13,7 +13,8 @@ import (
 type Status string
 
 const (
-	StatusPending  Status = "pending"  // waiting for dependencies or an approval gate
+	StatusPending  Status = "pending"  // created but not dispatched yet (e.g. queued for a slot)
+	StatusWaiting  Status = "waiting"  // dispatched but blocked on upstream stages or a manual approval
 	StatusRunning  Status = "running"  // executing
 	StatusSuccess  Status = "success"  // finished successfully
 	StatusFailed   Status = "failed"   // finished with failure

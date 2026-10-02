@@ -84,6 +84,19 @@ func waitStageStatus(t *testing.T, eng *Engine, id, stage string, want model.Sta
 	t.Fatalf("stage %s did not reach %q within %v", stage, want, timeout)
 }
 
+func waitRunStatus(t *testing.T, eng *Engine, id string, want model.Status, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		run, _ := eng.GetRun(context.Background(), id)
+		if run != nil && run.Status == want {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("run %s did not reach %q within %v", id, want, timeout)
+}
+
 func stageByName(run *model.Run, name string) *model.StageState {
 	return run.Stage(name)
 }
@@ -171,7 +184,8 @@ func TestApprovalPassThenRunSucceeds(t *testing.T) {
 		},
 	)
 	id, _, _ := eng.TriggerEvent(context.Background(), cfg, pushEvent("appr1"))
-	waitStageStatus(t, eng, id, "deploy", model.StatusPending, 3*time.Second)
+	waitStageStatus(t, eng, id, "deploy", model.StatusWaiting, 3*time.Second)
+	waitRunStatus(t, eng, id, model.StatusWaiting, 3*time.Second)
 
 	// Unauthorized approver is rejected.
 	if _, err := eng.Approve(context.Background(), id, "deploy", "mallory"); err == nil {
@@ -203,7 +217,7 @@ func TestApprovalRejectFailsWithAuditComment(t *testing.T) {
 		model.Stage{Name: "after", Needs: []string{"deploy"}, Tasks: []model.Task{shellTask("ok", "true")}},
 	)
 	id, _, _ := eng.TriggerEvent(context.Background(), cfg, pushEvent("appr2"))
-	waitStageStatus(t, eng, id, "deploy", model.StatusPending, 3*time.Second)
+	waitStageStatus(t, eng, id, "deploy", model.StatusWaiting, 3*time.Second)
 
 	if _, err := eng.Reject(context.Background(), id, "deploy", "alice", "  "); err == nil {
 		t.Fatal("reject without comment must fail")
@@ -357,9 +371,11 @@ func TestCancelRunKillsChildren(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
+	sawTerminal := false
 	for time.Now().Before(deadline) {
 		run, _ := eng.GetRun(context.Background(), id)
 		if run.Status.IsTerminal() {
+			sawTerminal = true
 			if run.Status != model.StatusCanceled {
 				t.Fatalf("status = %s, want canceled", run.Status)
 			}
@@ -367,9 +383,21 @@ func TestCancelRunKillsChildren(t *testing.T) {
 				stageByName(run, "down").Status != model.StatusCanceled {
 				t.Fatalf("downstream stage = %s", stageByName(run, "down").Status)
 			}
+		}
+		// The run reaches its terminal state first; the executing child is
+		// killed and reaped immediately afterwards, so wait for both.
+		if sawTerminal && eng.ActiveChildren() == 0 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if !sawTerminal {
+		t.Fatal("run never reached a terminal state")
+	}
+	// Final bounded check: no child process may survive cancellation.
+	idleDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(idleDeadline) && eng.ActiveChildren() != 0 {
+		time.Sleep(10 * time.Millisecond)
 	}
 	if eng.ActiveChildren() != 0 {
 		t.Fatalf("%d child processes still running after cancel", eng.ActiveChildren())
@@ -379,31 +407,35 @@ func TestCancelRunKillsChildren(t *testing.T) {
 func TestConcurrencyLimitQueuesRuns(t *testing.T) {
 	eng, dir := newTestEngine(t, 1)
 	cfg := triggerCfg(dir,
-		model.Stage{Name: "long", Tasks: []model.Task{shellTask("sleep", "sleep 1")}},
+		model.Stage{Name: "long", Tasks: []model.Task{shellTask("sleep", "sleep 1; sleep 0.5")}},
 	)
 	id1, _, _ := eng.TriggerEvent(context.Background(), cfg, pushEvent("c1"))
 	id2, _, _ := eng.TriggerEvent(context.Background(), cfg, pushEvent("c2"))
 
-	// Within the run, at least one poll must show one running and one pending.
-	sawQueued := false
+	// The second run must acquire no slot while the first is running:
+	// its stage never leaves pending (not waiting, not running).
 	deadline := time.Now().Add(2 * time.Second)
+	sawBlocking := false
 	for time.Now().Before(deadline) {
 		r1, _ := eng.GetRun(context.Background(), id1)
 		r2, _ := eng.GetRun(context.Background(), id2)
-		states := map[string]int{}
-		states[string(r1.Status)]++
-		states[string(r2.Status)]++
-		if states["running"] == 1 && states["pending"] == 1 {
-			sawQueued = true
-			break
+		if r1.Status == model.StatusRunning && r2.Status == model.StatusPending {
+			st := r2.Stages[0].Status
+			if st == model.StatusPending {
+				sawBlocking = true
+			}
+			if st == model.StatusWaiting || st == model.StatusRunning {
+				t.Fatalf("queued run dispatched its stage (%s) before the slot freed", st)
+			}
 		}
 		if r1.Status.IsTerminal() && r2.Status.IsTerminal() {
-			break
+			goto done
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !sawQueued {
-		t.Fatal("expected one run queued (pending) while the other was running")
+done:
+	if !sawBlocking {
+		t.Fatal("expected the second run to remain queued (run+stage pending)")
 	}
 	waitTerminal(t, eng, id1, 10*time.Second)
 	waitTerminal(t, eng, id2, 10*time.Second)
@@ -418,6 +450,10 @@ func TestRunTimeoutCancels(t *testing.T) {
 	run := waitTerminal(t, eng, id, 5*time.Second)
 	if run.Status != model.StatusCanceled {
 		t.Fatalf("status = %s, want canceled", run.Status)
+	}
+	idleDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(idleDeadline) && eng.ActiveChildren() != 0 {
+		time.Sleep(10 * time.Millisecond)
 	}
 	if eng.ActiveChildren() != 0 {
 		t.Fatal("timeout left a child process running")

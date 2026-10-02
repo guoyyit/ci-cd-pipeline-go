@@ -101,7 +101,7 @@ func TestEndToEndGitTriggerApproveAndSuccess(t *testing.T) {
 
 	// Wait until the deploy stage is pending approval.
 	waitRun(t, client, srv.URL+"/runs/"+runID, func(r *model.Run) bool {
-		return r.Stage("deploy") != nil && r.Stage("deploy").Status == model.StatusPending &&
+		return r.Stage("deploy") != nil && r.Stage("deploy").Status == model.StatusWaiting &&
 			r.Stage("build").Status == model.StatusSuccess
 	})
 

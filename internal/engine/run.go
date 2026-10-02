@@ -12,17 +12,33 @@ import (
 func (e *Engine) runLoop(runID string) {
 	defer e.wg.Done()
 
-	rootCtx := e.rootCtx
-	if rootCtx == nil {
-		rootCtx = context.Background()
-	}
-	ctx, cancel := context.WithCancel(rootCtx)
-	defer cancel()
-
-	h := &runHandle{id: runID, cancel: cancel}
+	// Bind to the handle pre-registered by TriggerEvent/launch so a cancel
+	// that arrived before this goroutine scheduled is already captured.
+	var ctx context.Context
 	e.mu.Lock()
-	e.active[runID] = h
+	h, ok := e.active[runID]
+	if !ok {
+		rootCtx := e.rootCtx
+		if rootCtx == nil {
+			rootCtx = context.Background()
+		}
+		runCtx, cancel := context.WithCancel(rootCtx)
+		h = &runHandle{id: runID, ctx: runCtx, cancel: cancel, release: cancel}
+		e.active[runID] = h
+		ctx = runCtx
+	}
+	ready := h.ready
 	e.mu.Unlock()
+	// Close readiness before any I/O or run-lock acquisition: CancelRun may
+	// be holding the run lock while waiting for this signal, so doing it
+	// under e.mu only (above) prevents a lock-order cycle.
+	if ready != nil {
+		close(ready)
+	}
+	if ctx == nil {
+		ctx = h.ctx
+	}
+	defer h.release()
 	defer func() {
 		e.mu.Lock()
 		delete(e.active, runID)
@@ -33,11 +49,16 @@ func (e *Engine) runLoop(runID string) {
 	if err != nil {
 		return
 	}
+	// A cancel accepted before the loop started already persisted the
+	// terminal state; honor it immediately and start nothing.
+	if run.Status.IsTerminal() {
+		return
+	}
 	var timeoutCh <-chan time.Time
 	if run.Deadline != nil {
 		d := time.Until(*run.Deadline)
 		if d <= 0 {
-			e.finish(ctx, run, model.StatusCanceled, "run deadline already exceeded at start")
+			e.markUnfinished(context.Background(), run, model.StatusCanceled, model.StatusCanceled, "run deadline already exceeded at start")
 			return
 		}
 		t := time.NewTimer(d)
@@ -48,13 +69,12 @@ func (e *Engine) runLoop(runID string) {
 	if err := e.acquireSlot(ctx, h); err != nil {
 		run, _ = e.st.LoadRun(context.Background(), runID)
 		if run != nil && !run.Status.IsTerminal() {
-			e.finish(context.Background(), run, model.StatusCanceled, "engine stopped before run started")
+			e.markUnfinished(context.Background(), run, model.StatusCanceled, model.StatusCanceled, "engine stopped before run started")
 		}
 		return
 	}
 	defer e.releaseSlot()
 
-	now := time.Now()
 	run, err = e.st.LoadRun(ctx, runID)
 	if err != nil {
 		return
@@ -62,28 +82,43 @@ func (e *Engine) runLoop(runID string) {
 	if run.Status.IsTerminal() {
 		return
 	}
-	run.Status = model.StatusRunning
-	run.StartedAt = &now
-	run.UpdatedAt = now
-	if err := e.st.SaveRun(ctx, run); err != nil {
-		return
+
+	// Stamp the start time once; the run status is derived from its stages
+	// (waiting while blocked, running while executing) on every scheduler
+	// tick, so a blocked run is never reported as running.
+	var changed bool
+	if run.StartedAt == nil {
+		now := time.Now()
+		run.StartedAt = &now
+		run.UpdatedAt = now
+		changed = true
+	}
+	if changed {
+		if err := e.st.SaveRun(ctx, run); err != nil {
+			return
+		}
 	}
 
 	sched := newScheduler(e, run)
 
-	for {
-		if err := ctx.Err(); err != nil {
-			run, _ = e.st.LoadRun(context.Background(), runID)
-			if run != nil && !run.Status.IsTerminal() {
-				e.markUnfinished(context.Background(), run, model.StatusCanceled, model.StatusCanceled, "run canceled")
-			}
-			return
+	finishWith := func(status model.Status, reason string) {
+		fresh, _ := e.st.LoadRun(context.Background(), runID)
+		if fresh != nil && !fresh.Status.IsTerminal() {
+			e.markUnfinished(context.Background(), fresh, status, status, reason)
 		}
+	}
+	for {
 		select {
 		case <-timeoutCh:
-			cancel()
-			run, _ = e.st.LoadRun(context.Background(), runID)
-			e.markUnfinished(context.Background(), run, model.StatusCanceled, model.StatusCanceled, "run timeout exceeded")
+			// Signal the run context so any executing child is killed and
+			// reaped, then persist the terminal state.
+			h.cancel()
+			finishWith(model.StatusCanceled, "run timeout exceeded")
+			return
+		case <-ctx.Done():
+			// Engine stop (the user-cancel path persisted the terminal
+			// state itself and would not reach this branch).
+			finishWith(model.StatusCanceled, "run canceled")
 			return
 		default:
 		}
@@ -100,11 +135,23 @@ func (e *Engine) runLoop(runID string) {
 		case actionDone:
 			return
 		case actionWaiting:
-			select {
-			case <-ctx.Done():
-			case <-time.After(200 * time.Millisecond):
-			}
-		case actionProgress:
+		}
+		// Yield before the next tick so timeout/cancel are observed
+		// promptly when the scheduler is blocked without making progress.
+		var delay time.Duration
+		if action == actionWaiting {
+			delay = 200 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timeoutCh:
+			timer.Stop()
+			h.cancel()
+			finishWith(model.StatusCanceled, "run timeout exceeded")
+			return
+		case <-timer.C:
 		}
 	}
 }
@@ -157,7 +204,6 @@ func (e *Engine) markUnfinished(ctx context.Context, run *model.Run, stageStatus
 	if err == nil {
 		run = fresh
 	}
-	changed := false
 	for i := range run.Stages {
 		st := &run.Stages[i]
 		if st.Status.IsTerminal() {
@@ -167,7 +213,6 @@ func (e *Engine) markUnfinished(ctx context.Context, run *model.Run, stageStatus
 		st.Reason = reason
 		now := time.Now()
 		st.FinishedAt = &now
-		changed = true
 		for j := range st.Tasks {
 			if !st.Tasks[j].Status.IsTerminal() {
 				st.Tasks[j].Status = stageStatus
@@ -179,11 +224,13 @@ func (e *Engine) markUnfinished(ctx context.Context, run *model.Run, stageStatus
 			st.Approval.Comment = reason
 			st.Approval.DecidedAt = &now
 		}
-		e.appr.Cancel(run.ID, st.Name, reason)
+		if st.Approval != nil {
+			e.appr.Cancel(run.ID, st.Name, reason)
+		}
 	}
-	if !changed {
-		return
-	}
+	// Even when every stage already reached a terminal state (e.g. a worker
+	// canceled its own stage concurrently), the run itself must be finalized
+	// here, otherwise it could stay running/waiting forever.
 	now := time.Now()
 	run.Status = finalStatus
 	run.Reason = reason

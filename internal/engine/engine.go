@@ -61,7 +61,10 @@ type Engine struct {
 // runHandle holds in-memory control structures for a live run.
 type runHandle struct {
 	id      string
-	cancel  context.CancelFunc // cancels this run's workers
+	ctx     context.Context    // canceled when the run is canceled or its owner exits
+	cancel  context.CancelFunc // cancels ctx
+	release context.CancelFunc // releases ctx after runLoop exits
+	ready   chan struct{}      // closed once runLoop has installed the handle
 	blocked bool               // waiting for an approval / concurrency slot
 }
 
@@ -176,7 +179,20 @@ func (e *Engine) TriggerEvent(ctx context.Context, cfg *model.Config, ev model.E
 		return "", false, nil
 	}
 
+	// Register the cancelable handle before the run exists on disk. A cancel
+	// request arriving in the gap before runLoop starts is therefore captured
+	// deterministically instead of racing with handle registration.
+	rootCtx := e.rootCtx
+	if rootCtx == nil {
+		rootCtx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(rootCtx)
+	h := e.registerHandle(run.ID, ctx, cancel, true)
+	e.mu.Lock()
+	e.mu.Unlock()
+
 	if err := e.st.SaveRun(ctx, run); err != nil {
+		e.removeHandle(run.ID, h)
 		return "", false, err
 	}
 
@@ -218,6 +234,30 @@ func (e *Engine) buildRun(cfg *model.Config, ev model.Event) *model.Run {
 func (e *Engine) launch(run *model.Run) {
 	e.wg.Add(1)
 	go e.runLoop(run.ID)
+}
+
+// registerHandle installs a cancelable handle for runID. Callers that race
+// with the run loop (event trigger) pass ready=true so the returned channel
+// is closed once the loop has bound itself to the handle.
+func (e *Engine) registerHandle(runID string, ctx context.Context, cancel context.CancelFunc, waitReady bool) *runHandle {
+	h := &runHandle{id: runID, ctx: ctx, cancel: cancel, release: cancel}
+	if waitReady {
+		h.ready = make(chan struct{})
+	}
+	e.mu.Lock()
+	e.active[runID] = h
+	e.mu.Unlock()
+	return h
+}
+
+// removeHandle deletes h only if it is still the registered handle.
+func (e *Engine) removeHandle(runID string, h *runHandle) {
+	e.mu.Lock()
+	if cur, ok := e.active[runID]; ok && cur == h {
+		delete(e.active, runID)
+	}
+	e.mu.Unlock()
+	h.cancel()
 }
 
 // GetRun returns a persisted run snapshot.

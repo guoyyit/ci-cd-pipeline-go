@@ -78,6 +78,10 @@ func (e *Engine) resumeRun(ctx context.Context, run *model.Run) {
 			resetStageState(st, "interrupted by daemon restart")
 		case model.StatusPending:
 			// Keep pending; it may become tainted by an interrupted upstream.
+		case model.StatusWaiting:
+			// Was blocked on upstream stages or an approval gate. The wait
+			// semantics survive the restart: the stage is not pending and
+			// the scheduler blocks/launches it from exactly this state.
 		}
 	}
 	// Taint every stage that (transitively) depends on an interrupted stage.
@@ -111,13 +115,34 @@ func (e *Engine) resumeRun(ctx context.Context, run *model.Run) {
 		}
 	}
 
+	// Restore the waiting semantics in the same write: stages that were
+	// blocked on unfinished upstreams at shutdown are waiting, not pending.
+	// (A pending stage whose upstreams are all done will simply be launched
+	// by the first scheduler tick.)
+	for i := range run.Stages {
+		st := &run.Stages[i]
+		if st.Status != model.StatusPending || tainted[st.Name] {
+			continue
+		}
+		for _, dep := range deps[st.Name] {
+			ds := run.Stage(dep)
+			if ds != nil && !ds.Status.IsTerminal() {
+				st.Status = model.StatusWaiting
+				break
+			}
+		}
+	}
+
 	// Run deadlines that already passed are honored immediately on resume.
 	if run.Deadline != nil && !run.Deadline.After(now) {
 		e.markUnfinished(ctx, run, model.StatusCanceled, model.StatusCanceled, "run deadline exceeded before restart")
 		return
 	}
 
-	run.Status = model.StatusPending
+	// Preserve the waiting semantics on the run itself: if any stage is
+	// still waiting, the run resumes as waiting; otherwise it re-enters the
+	// queue as pending (the scheduler promotes it on the first tick).
+	run.Status = deriveRunStatus(run)
 	run.StartedAt = nil
 	run.FinishedAt = nil
 	run.Reason = "resumed after daemon restart"

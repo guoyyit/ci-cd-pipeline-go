@@ -22,6 +22,11 @@ func (s *scheduler) executeStage(ctx context.Context, runID string, stageIdx int
 		})
 		return
 	}
+	// Never execute any stage of an already-canceled run (covers the race
+	// where a cancel landed between the scheduler gate and goroutine start).
+	if fresh, err := s.eng.st.LoadRun(ctx, runID); err == nil && fresh.Status.IsTerminal() {
+		return
+	}
 
 	// Stage-scoped timeout.
 	sctx, cancel := context.WithCancel(ctx)
@@ -44,9 +49,46 @@ func (s *scheduler) executeStage(ctx context.Context, runID string, stageIdx int
 
 	// --- Approval gate -----------------------------------------------------
 	if stCfg.Approval != nil && stCfg.Approval.Required {
-		decision, err := s.awaitApproval(sctx, runID, stCfg)
+		// Persist the waiting stage state together with the pending approval
+		// record in one atomic write, so queries and restart recovery always
+		// see both at once.
+		state, reqErr := s.eng.appr.Request(ctx, runID, stCfg.Name, stCfg.Approval)
+		if reqErr != nil {
+			_, _ = s.eng.MutateRun(context.Background(), runID, func(run *model.Run) error {
+				if !run.Status.IsTerminal() {
+					s.setFail(run, stageIdx, "approval error: "+reqErr.Error())
+				}
+				return nil
+			})
+			return
+		}
+		if _, err := s.eng.MutateRun(ctx, runID, func(run *model.Run) error {
+			if run.Status.IsTerminal() {
+				return errRunTerminal
+			}
+			st := &run.Stages[stageIdx]
+			st.Status = model.StatusWaiting
+			st.Approval = state
+			run.UpdatedAt = time.Now()
+			return nil
+		}); err != nil {
+			s.eng.appr.Remove(runID, stCfg.Name)
+			return
+		}
+		decision, waitErr := s.eng.appr.Wait(sctx, runID, stCfg.Name)
+		_, _ = s.eng.MutateRun(context.Background(), runID, func(run *model.Run) error {
+			if st := run.Stage(stCfg.Name); st != nil && decision != nil {
+				st.Approval = decision
+				run.UpdatedAt = time.Now()
+			}
+			return nil
+		})
+		err := waitErr
 		if err != nil && decision == nil {
 			_, _ = s.eng.MutateRun(context.Background(), runID, func(run *model.Run) error {
+				if run.Status.IsTerminal() {
+					return nil
+				}
 				s.setFail(run, stageIdx, "approval error: "+err.Error())
 				return nil
 			})
@@ -55,6 +97,9 @@ func (s *scheduler) executeStage(ctx context.Context, runID string, stageIdx int
 		if decision != nil && decision.Status != model.StatusSuccess {
 			reason := "approval: " + decision.Comment
 			_, _ = s.eng.MutateRun(context.Background(), runID, func(run *model.Run) error {
+				if run.Status.IsTerminal() {
+					return nil
+				}
 				if decision.Status == model.StatusCanceled {
 					s.setCancel(run, stageIdx, reason)
 				} else {
@@ -64,9 +109,9 @@ func (s *scheduler) executeStage(ctx context.Context, runID string, stageIdx int
 			})
 			return
 		}
-		// If the run was canceled while waiting, nothing more to do.
-		run, _ := s.eng.MutateRun(context.Background(), runID, func(run *model.Run) error { return nil })
-		if run != nil && run.Status.IsTerminal() {
+		// If the run was canceled while waiting, start no tasks.
+		run, _ := s.eng.st.LoadRun(context.Background(), runID)
+		if run == nil || run.Status.IsTerminal() {
 			return
 		}
 	}
@@ -79,6 +124,7 @@ func (s *scheduler) executeStage(ctx context.Context, runID string, stageIdx int
 		now := time.Now()
 		st := &run.Stages[stageIdx]
 		st.Status = model.StatusRunning
+		st.Reason = ""
 		st.StartedAt = &now
 		run.UpdatedAt = now
 		return nil
@@ -98,8 +144,14 @@ func (s *scheduler) executeStage(ctx context.Context, runID string, stageIdx int
 		}
 		var taskErr error
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
-			if sctx.Err() != nil {
-				break
+			if sctx.Err() != nil || ctx.Err() != nil {
+				_, _ = s.eng.MutateRun(context.Background(), runID, func(run *model.Run) error {
+					if !run.Status.IsTerminal() {
+						s.setCancel(run, stageIdx, s.reason(timedOut))
+					}
+					return nil
+				})
+				return
 			}
 			taskErr = s.runOneTask(sctx, runID, stageIdx, task, attempt)
 			if taskErr == nil || errors.Is(taskErr, executor.ErrCanceled) {
@@ -156,33 +208,6 @@ func (s *scheduler) stageCfgByIndex(idx int) *model.Stage {
 		return nil
 	}
 	return &s.cfg.Stages[idx]
-}
-
-// awaitApproval registers and persists a pending approval and blocks for the
-// decision. It also persists the final manager-side decision (timeout).
-func (s *scheduler) awaitApproval(ctx context.Context, runID string, stCfg *model.Stage) (*model.ApprovalState, error) {
-	state, err := s.eng.appr.Request(ctx, runID, stCfg.Name, stCfg.Approval)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := s.eng.MutateRun(ctx, runID, func(run *model.Run) error {
-		if st := run.Stage(stCfg.Name); st != nil {
-			st.Approval = state
-			run.UpdatedAt = time.Now()
-		}
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	decision, waitErr := s.eng.appr.Wait(ctx, runID, stCfg.Name)
-	_, _ = s.eng.MutateRun(context.Background(), runID, func(run *model.Run) error {
-		if st := run.Stage(stCfg.Name); st != nil && decision != nil {
-			st.Approval = decision
-			run.UpdatedAt = time.Now()
-		}
-		return nil
-	})
-	return decision, waitErr
 }
 
 func (s *scheduler) runOneTask(ctx context.Context, runID string, stageIdx int, task model.Task, attempt int) error {
