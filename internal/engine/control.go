@@ -20,17 +20,27 @@ func (e *Engine) CancelRun(ctx context.Context, id, reason string) error {
 	if run.Status.IsTerminal() {
 		return ErrRunActive
 	}
+	userReason := reasonOr(reason, "canceled by user")
 	e.mu.Lock()
 	h, ok := e.active[id]
 	e.mu.Unlock()
 	if ok {
+		// Record the reason so the run loop persists it (also onto the
+		// approval audit record), and cancel any pending approval up-front
+		// so its persisted comment keeps the user's reason.
+		e.mu.Lock()
+		h.reason = userReason
+		e.mu.Unlock()
+		if pa := run.PendingApproval(); pa != nil {
+			e.appr.Cancel(id, pa.Name, userReason)
+		}
 		// The run loop observes ctx cancellation and persists the final state.
 		h.cancel()
 		return nil
 	}
 	// Not currently driven by a loop (queued-but-not-loaded edge or orphaned):
 	// persist cancellation directly.
-	e.markUnfinished(ctx, run, model.StatusCanceled, model.StatusCanceled, reasonOr(reason, "canceled by user"))
+	e.markUnfinished(ctx, run, model.StatusCanceled, model.StatusCanceled, userReason)
 	return nil
 }
 

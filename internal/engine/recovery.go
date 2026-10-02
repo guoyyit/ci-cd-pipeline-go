@@ -78,6 +78,11 @@ func (e *Engine) resumeRun(ctx context.Context, run *model.Run) {
 			resetStageState(st, "interrupted by daemon restart")
 		case model.StatusPending:
 			// Keep pending; it may become tainted by an interrupted upstream.
+		case model.StatusWaiting:
+			// Blocked on upstream stages or parked at an approval gate:
+			// not executing, so nothing was interrupted. Keep waiting;
+			// a pending approval is re-armed below and the stage resumes
+			// its wait once the scheduler relaunches it.
 		}
 	}
 	// Taint every stage that (transitively) depends on an interrupted stage.

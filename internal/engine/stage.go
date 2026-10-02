@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/guoyyit/ci-cd-pipeline-go/internal/executor"
@@ -32,11 +33,11 @@ func (s *scheduler) executeStage(ctx context.Context, runID string, stageIdx int
 		defer t.Stop()
 		timerCh = t.C
 	}
-	timedOut := false
+	var timedOut atomic.Bool
 	go func() {
 		select {
 		case <-timerCh:
-			timedOut = true
+			timedOut.Store(true)
 			cancel()
 		case <-sctx.Done():
 		}
@@ -44,6 +45,15 @@ func (s *scheduler) executeStage(ctx context.Context, runID string, stageIdx int
 
 	// --- Approval gate -----------------------------------------------------
 	if stCfg.Approval != nil && stCfg.Approval.Required {
+		if sctx.Err() != nil {
+			// Canceled before the gate was reached: do not open a spurious
+			// approval request on an already-canceled run.
+			_, _ = s.eng.MutateRun(context.Background(), runID, func(run *model.Run) error {
+				s.setCancel(run, stageIdx, s.reason(timedOut.Load()))
+				return nil
+			})
+			return
+		}
 		decision, err := s.awaitApproval(sctx, runID, stCfg)
 		if err != nil && decision == nil {
 			_, _ = s.eng.MutateRun(context.Background(), runID, func(run *model.Run) error {
@@ -91,7 +101,7 @@ func (s *scheduler) executeStage(ctx context.Context, runID string, stageIdx int
 	for _, task := range stCfg.Tasks {
 		if sctx.Err() != nil {
 			_, _ = s.eng.MutateRun(context.Background(), runID, func(run *model.Run) error {
-				s.setCancel(run, stageIdx, s.reason(timedOut))
+				s.setCancel(run, stageIdx, s.reason(timedOut.Load()))
 				return nil
 			})
 			return
@@ -109,7 +119,7 @@ func (s *scheduler) executeStage(ctx context.Context, runID string, stageIdx int
 		if taskErr != nil {
 			if errors.Is(taskErr, executor.ErrCanceled) || sctx.Err() != nil {
 				_, _ = s.eng.MutateRun(context.Background(), runID, func(run *model.Run) error {
-					s.setCancel(run, stageIdx, s.reason(timedOut))
+					s.setCancel(run, stageIdx, s.reason(timedOut.Load()))
 					return nil
 				})
 				return
@@ -168,6 +178,11 @@ func (s *scheduler) awaitApproval(ctx context.Context, runID string, stCfg *mode
 	if _, err := s.eng.MutateRun(ctx, runID, func(run *model.Run) error {
 		if st := run.Stage(stCfg.Name); st != nil {
 			st.Approval = state
+			// The stage is now parked at the approval gate: surface the
+			// waiting state instead of leaving it pending/running.
+			if st.Status == model.StatusPending || st.Status == model.StatusWaiting {
+				st.Status = model.StatusWaiting
+			}
 			run.UpdatedAt = time.Now()
 		}
 		return nil

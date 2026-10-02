@@ -6,7 +6,7 @@
 - 提交 / 标签事件触发，分支与标签 glob 过滤
 - 同一事件**绝不重复创建运行**（先占事件去重记录，再创建运行）
 - 阶段**串行 / 并行**依赖（`group` 并行分组或显式 `needs` DAG）
-- 六种运行状态：`pending` / `running` / `success` / `failed` / `canceled` / `skipped`
+- 七种运行状态：`pending` / `waiting` / `running` / `success` / `failed` / `canceled` / `skipped`
 - 人工**审批门禁**：等待、可配置超时取消、拒绝必须填写可审计意见
 - 失败**自动重试**与**手动重跑**：默认只重跑失败及受影响下游，成功阶段不重复执行；`force` 才全量重跑
 - 运行/阶段**超时**、用户**取消**、**并发上限**；取消向子进程**整组传播**，不遗留孙子进程
@@ -113,12 +113,26 @@ go run ./cmd/pipelinectl rerun  <run-id> -force   # 全量重跑
 
 | 状态 | Run / Stage / Task 含义 |
 | --- | --- |
-| `pending` | 已创建但尚未开始：排队等并发槽、等上游阶段，或停在审批门前。 |
-| `running` | 正在执行。 |
+| `pending` | 已创建但尚未开始：排队等并发槽，或尚未被调度评估。 |
+| `waiting` | **等待中**：阶段在等上游阶段完成，或停在人工审批门前；运行在所有未决阶段都阻塞（无任务在执行）时呈现等待。 |
+| `running` | 正在执行（运行至少有一个阶段在执行任务）。 |
 | `success` | 成功完成（运行要求所有阶段成功）。 |
 | `failed` | 任务失败（重试耗尽/审批被拒），或整体存在失败/被跳过阶段。 |
 | `canceled` | 被用户取消、运行/阶段/审批超时、或守护进程关闭；正在执行的子进程被整组 SIGKILL。 |
 | `skipped` | 上游阶段 `failed/canceled`，下游不再启动，标记为跳过。 |
+
+### 等待状态（waiting）
+
+`waiting` 是新增的非终态取值，用于把「等待」与「未开始（`pending`）」「执行中（`running`）」明确区分：
+
+- **阶段等待上游**：调度器判定某阶段的上游尚未全部成功时，该阶段从 `pending` 变为 `waiting`，
+  直到上游就绪后才进入 `running`。
+- **阶段等待审批**：阶段到达人工审批门、审批记录处于 `pending` 时，阶段呈现 `waiting`。
+- **运行等待**：当运行没有任何执行中的阶段、且仍有阶段处于 `waiting`（等审批或等上游）时，
+  运行整体呈现 `waiting`；一旦有阶段开始执行即回到 `running`。
+
+等待状态会随运行状态**一并持久化**，因此 `pipelinectl get`、HTTP 查询与重启后的恢复流程看到的
+等待语义一致；恢复流程不会把等待中的运行误判为执行中（等待的阶段不会被当作崩溃中断而重跑）。
 
 判定规则：
 
@@ -127,10 +141,21 @@ go run ./cmd/pipelinectl rerun  <run-id> -force   # 全量重跑
 
 ## 事件去重
 
+### 启动基线
+
+守护进程**启动后的首轮仓库扫描只建立事件基线，不产生任何运行**：扫描到的、在启动之前就
+已存在的提交与标签会被记录为「已见」，但不会触发流水线。只有**启动之后新产生**的提交或
+标签才会触发运行。因此对一个已有历史提交与标签的仓库启动服务，首轮扫描的事件数为零、
+不会为重放的历史事件创建任何运行。
+
+### 去重规则
+
 事件的稳定 ID 为 `<kind>:<ref>:<commit>`（如 `push:main:<sha>`、`tag:v1:<sha>`）。
 分支头未变化时反复扫描不会重复触发；强推产生新 SHA、或新标签，才会产生新事件。
 处理顺序为「**先原子创建事件记录（O_EXCL）→ 再创建运行**」，因此即使事件并发到达或进程崩溃，
 同一事件最多产生一个运行，且不会留下幽灵运行文件。
+事件记录持久化在 `<data>/events/` 下，**进程重启后仍然有效**：重复扫描或重启后重复到达的
+同一事件会被识别并拒绝，不会重复创建运行。
 
 ## 重试与重跑
 
@@ -145,6 +170,18 @@ go run ./cmd/pipelinectl rerun  <run-id> -force   # 全量重跑
 - 每个任务在独立**进程组**中启动；取消时向负 PID 发 `SIGKILL`，`sh` 派生的孙子进程一并被回收，
   引擎跟踪活动子进程并在退出前校验 `active child processes at exit: 0`。
 - `concurrency` 限制并发运行数，超额运行保持 `pending` 排队，槽位释放后自动开始。
+
+### 取消与启动并发的时序保证
+
+取消与运行启动并发时行为是**确定**的，与具体交错时序无关：
+
+- 取消请求一旦被接受（运行尚未到达终态），运行**必然在有限时间内收敛到 `canceled`**，
+  不会停留在 `running`/`waiting` 无法收尾，也不会再启动新的阶段或任务。
+- 正在执行的子任务会收到取消信号并以 `SIGKILL` 整组退出，不会遗留继续运行的子进程。
+- 运行已到达终态后再取消会被拒绝（`run is not active`）；**先到者生效**——若取消先于运行
+  收尾落盘，则运行记为 `canceled`，否则保持已完成的终态。
+- 取消发生在**等待审批**的运行上时同样立即生效：审批记录被标记为 `canceled` 并**保留取消
+  原因**，等待中的下游阶段不会启动。
 
 ## 持久化与崩溃恢复
 
@@ -161,6 +198,8 @@ go run ./cmd/pipelinectl rerun  <run-id> -force   # 全量重跑
 - `resume`（默认）：磁盘上处于 `running` 的阶段只能是崩溃中断，重置该阶段为 `pending` 并把其
   传递下游一并重置（含曾经成功但依赖被中断阶段的阶段）；已经 `success` 的阶段保留不重跑；
   已存在的 pending 审批会重新挂回内存，可继续审批。
+  处于 `waiting` 的阶段（等上游或等审批）**不是**崩溃中断，保持等待不被重跑；等待中的运行
+  恢复后仍回到 `waiting`，审批语义与重启前一致。
 - `cancel`：所有未完成运行标记为 `canceled`。
 - `fail`：所有未完成运行标记为 `failed`。
 - 终态运行一律不动，杜绝重启后重复执行。
@@ -198,7 +237,31 @@ internal/server     本地 HTTP 控制面
 go test ./... -race -count=1
 ```
 
+本地验证（在竞态检测下连续多轮，确认无不稳定失败）：
+
+```bash
+# 全量测试 + 竞态检测
+go test ./... -race -count=1
+
+# 关键并发/恢复场景连续跑 10 轮，必须全部稳定通过
+go test ./internal/engine/ -race -count=10 \
+  -run 'TestCancelImmediatelyAfterCreateAlwaysConverges|TestCancelDuringApprovalLeavesNoChildren|TestWaitingStatusSurvivesRestart|TestFirstScanBaselineProducesNoRuns'
+```
+
 覆盖场景：重复事件去重、串行/并行阶段依赖与下游跳过、审批通过/拒绝（意见可追溯）/超时、
 自动重试、手动重跑（成功阶段不重复 + force 全量）、运行取消（子进程不遗留）、并发上限排队、
 运行/阶段超时、`resume/cancel/fail` 重启恢复、产物收集，以及基于真实临时 git 仓库与真实
 HTTP 服务的提交→触发→审批→成功端到端验收。
+
+针对本次三类问题新增的覆盖：
+
+- **启动基线**：在含历史提交与标签的真实仓库上启动，断言首轮扫描事件数为零、不产生任何运行
+  （`TestWatcherFirstScanIsBaseline`、`TestFirstScanBaselineProducesNoRuns`）。
+- **重复事件**：同一事件重复触发、重复扫描、进程重启后重复到达均不产生重复运行
+  （`TestDuplicateEventCreatesOneRun`、`TestDuplicateEventAfterRestartNoNewRun`）。
+- **等待状态**：等待上游/等待审批在查询与持久化中呈现 `waiting`，重启恢复后等待语义不变
+  （`TestWaitingStatusVisibleAndPersisted`、`TestWaitingOnUpstreamStageVisible`、`TestWaitingStatusSurvivesRestart`）。
+- **取消并发**：运行创建后立即取消的时序交错下取消必然收敛、不遗留子进程；等待审批时取消
+  保留取消原因、下游不启动、不遗留子进程
+  （`TestCancelImmediatelyAfterCreateAlwaysConverges`、`TestCancelDuringApprovalLeavesNoChildren`、
+  `TestMarkUnfinishedConvergesWhenStagesTerminal`）。

@@ -63,6 +63,7 @@ type runHandle struct {
 	id      string
 	cancel  context.CancelFunc // cancels this run's workers
 	blocked bool               // waiting for an approval / concurrency slot
+	reason  string             // cancel reason recorded by CancelRun
 }
 
 // Options configures a new Engine.

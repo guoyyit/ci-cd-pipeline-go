@@ -140,3 +140,43 @@ func TestWatcherPrimeMapSuppressesHistory(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
+
+// TestWatcherFirstScanIsBaseline ensures that starting a watcher on a
+// repository that already has commits and tags does NOT emit events for the
+// pre-existing history: the first scan only establishes the baseline. Only
+// refs created after the start may produce events.
+func TestWatcherFirstScanIsBaseline(t *testing.T) {
+	dir := newRepo(t)
+	// Pre-existing history: extra commits and a tag before the watcher starts.
+	commit(t, dir, "historical-1")
+	commit(t, dir, "historical-2")
+	gitCmd(t, dir, "tag", "v0.9.0")
+
+	w := NewWatcher(dir, 20*time.Millisecond, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	events := make(chan model.Event, 16)
+	go func() { _ = w.Run(ctx, events) }()
+
+	// For several poll intervals no event may be emitted for existing refs.
+	select {
+	case ev := <-events:
+		t.Fatalf("first scan emitted a historical event: %+v", ev)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// A commit created after the start must still be observed exactly once.
+	commit(t, dir, "after-start")
+	deadline := time.Now().Add(3 * time.Second)
+	var got []model.Event
+	for time.Now().Before(deadline) && len(got) == 0 {
+		select {
+		case ev := <-events:
+			got = append(got, ev)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if len(got) != 1 || got[0].Kind != model.KindPush || got[0].Branch != "main" {
+		t.Fatalf("expected exactly one push event for the new commit, got %+v", got)
+	}
+}

@@ -171,7 +171,7 @@ func TestApprovalPassThenRunSucceeds(t *testing.T) {
 		},
 	)
 	id, _, _ := eng.TriggerEvent(context.Background(), cfg, pushEvent("appr1"))
-	waitStageStatus(t, eng, id, "deploy", model.StatusPending, 3*time.Second)
+	waitStageStatus(t, eng, id, "deploy", model.StatusWaiting, 3*time.Second)
 
 	// Unauthorized approver is rejected.
 	if _, err := eng.Approve(context.Background(), id, "deploy", "mallory"); err == nil {
@@ -203,7 +203,7 @@ func TestApprovalRejectFailsWithAuditComment(t *testing.T) {
 		model.Stage{Name: "after", Needs: []string{"deploy"}, Tasks: []model.Task{shellTask("ok", "true")}},
 	)
 	id, _, _ := eng.TriggerEvent(context.Background(), cfg, pushEvent("appr2"))
-	waitStageStatus(t, eng, id, "deploy", model.StatusPending, 3*time.Second)
+	waitStageStatus(t, eng, id, "deploy", model.StatusWaiting, 3*time.Second)
 
 	if _, err := eng.Reject(context.Background(), id, "deploy", "alice", "  "); err == nil {
 		t.Fatal("reject without comment must fail")

@@ -135,6 +135,16 @@ func (s *scheduler) tick(ctx context.Context) (tickAction, error) {
 		switch decide(depStates) {
 		case depBlocked:
 			waiting = true
+			if st.Status != model.StatusWaiting {
+				idx := i
+				_, _ = s.eng.MutateRun(ctx, run.ID, func(r *model.Run) error {
+					s.markWaitingLocked(r, idx)
+					return nil
+				})
+				// Mirror into this tick's copy so the run-status derivation
+				// below observes the transition immediately.
+				st.Status = model.StatusWaiting
+			}
 			continue
 		case depSkip:
 			idx := i
@@ -145,6 +155,12 @@ func (s *scheduler) tick(ctx context.Context) (tickAction, error) {
 			progress = true
 			continue
 		case depReady:
+			if ctx.Err() != nil {
+				// The run was canceled concurrently; never launch a new
+				// stage after cancellation.
+				waiting = true
+				continue
+			}
 			idx := i
 			s.mu.Lock()
 			s.launched[st.Name] = true
@@ -165,6 +181,7 @@ func (s *scheduler) tick(ctx context.Context) (tickAction, error) {
 		})
 		return actionDone, nil
 	}
+	s.syncRunStatus(ctx, run)
 	if progress {
 		return actionProgress, nil
 	}
@@ -192,7 +209,7 @@ func decide(deps []model.Status) depDecision {
 	for _, d := range deps {
 		switch d {
 		case model.StatusSuccess:
-		case model.StatusPending, model.StatusRunning:
+		case model.StatusPending, model.StatusWaiting, model.StatusRunning:
 			allSuccess = false
 		default: // failed / canceled / skipped
 			return depSkip
@@ -226,6 +243,76 @@ func (s *scheduler) skipStageLocked(run *model.Run, idx int, reason string) {
 		st.Tasks[j].FinishedAt = &now
 	}
 	run.UpdatedAt = now
+}
+
+// markWaitingLocked transitions a dependency-blocked stage to waiting.
+// Caller must hold the run lock.
+func (s *scheduler) markWaitingLocked(run *model.Run, idx int) {
+	st := &run.Stages[idx]
+	if st.Status != model.StatusPending {
+		return
+	}
+	st.Status = model.StatusWaiting
+	run.UpdatedAt = time.Now()
+}
+
+// isLaunched reports whether a worker goroutine owns the stage.
+func (s *scheduler) isLaunched(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.launched[name]
+}
+
+// deriveRunStatus computes the run's display status from its stage states:
+// any executing stage means running; otherwise any stage blocked on upstream
+// stages or parked at an approval gate means waiting. It returns "" when the
+// current status should be kept. A launched stage that has not persisted a
+// pending approval yet is still starting up, so it counts as running.
+func (s *scheduler) deriveRunStatus(run *model.Run) model.Status {
+	waiting := false
+	for i := range run.Stages {
+		st := &run.Stages[i]
+		switch st.Status {
+		case model.StatusRunning:
+			return model.StatusRunning
+		case model.StatusWaiting:
+			if st.Approval != nil && st.Approval.Status == model.StatusPending {
+				waiting = true
+				continue
+			}
+			if s.isLaunched(st.Name) {
+				return model.StatusRunning
+			}
+			waiting = true
+		}
+	}
+	if waiting {
+		return model.StatusWaiting
+	}
+	return ""
+}
+
+// syncRunStatus persists a running<->waiting transition when the derived
+// status differs from the persisted one. Queued (pending) and terminal runs
+// are never touched, so a concurrent cancel always wins.
+func (s *scheduler) syncRunStatus(ctx context.Context, run *model.Run) {
+	cur := run.Status
+	if cur != model.StatusRunning && cur != model.StatusWaiting {
+		return
+	}
+	if want := s.deriveRunStatus(run); want == "" || want == cur {
+		return
+	}
+	_, _ = s.eng.MutateRun(ctx, run.ID, func(r *model.Run) error {
+		if r.Status != model.StatusRunning && r.Status != model.StatusWaiting {
+			return nil
+		}
+		if w := s.deriveRunStatus(r); w != "" && w != r.Status {
+			r.Status = w
+			r.UpdatedAt = time.Now()
+		}
+		return nil
+	})
 }
 
 func (s *scheduler) allTerminal(run *model.Run) bool {

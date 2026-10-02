@@ -48,7 +48,7 @@ func (e *Engine) runLoop(runID string) {
 	if err := e.acquireSlot(ctx, h); err != nil {
 		run, _ = e.st.LoadRun(context.Background(), runID)
 		if run != nil && !run.Status.IsTerminal() {
-			e.finish(context.Background(), run, model.StatusCanceled, "engine stopped before run started")
+			e.finish(context.Background(), run, model.StatusCanceled, e.cancelReason(h, "engine stopped before run started"))
 		}
 		return
 	}
@@ -62,20 +62,25 @@ func (e *Engine) runLoop(runID string) {
 	if run.Status.IsTerminal() {
 		return
 	}
+	sched := newScheduler(e, run)
+	// A resumed run whose stages are all still blocked (e.g. parked at an
+	// approval gate) must come back up as waiting, not running; a fresh run
+	// has no waiting stages yet and starts as running.
 	run.Status = model.StatusRunning
+	if w := sched.deriveRunStatus(run); w != "" {
+		run.Status = w
+	}
 	run.StartedAt = &now
 	run.UpdatedAt = now
 	if err := e.st.SaveRun(ctx, run); err != nil {
 		return
 	}
 
-	sched := newScheduler(e, run)
-
 	for {
 		if err := ctx.Err(); err != nil {
 			run, _ = e.st.LoadRun(context.Background(), runID)
 			if run != nil && !run.Status.IsTerminal() {
-				e.markUnfinished(context.Background(), run, model.StatusCanceled, model.StatusCanceled, "run canceled")
+				e.markUnfinished(context.Background(), run, model.StatusCanceled, model.StatusCanceled, e.cancelReason(h, "run canceled"))
 			}
 			return
 		}
@@ -147,6 +152,18 @@ func (e *Engine) releaseSlot() {
 	}
 }
 
+// cancelReason returns the user-supplied cancel reason recorded on the run
+// handle, falling back to a generic reason when the cancellation did not
+// originate from CancelRun (engine stop, deadline).
+func (e *Engine) cancelReason(h *runHandle, fallback string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if h.reason != "" {
+		return h.reason
+	}
+	return fallback
+}
+
 // markUnfinished marks all non-terminal stages/tasks with the given status
 // (skipped or canceled) and finalizes the run accordingly.
 func (e *Engine) markUnfinished(ctx context.Context, run *model.Run, stageStatus, finalStatus model.Status, reason string) {
@@ -157,7 +174,12 @@ func (e *Engine) markUnfinished(ctx context.Context, run *model.Run, stageStatus
 	if err == nil {
 		run = fresh
 	}
-	changed := false
+	// A run that is already final must never be moved again; the first
+	// terminal state wins so a concurrent cancel cannot clobber a result.
+	if run.Status.IsTerminal() {
+		return
+	}
+	now := time.Now()
 	for i := range run.Stages {
 		st := &run.Stages[i]
 		if st.Status.IsTerminal() {
@@ -165,9 +187,7 @@ func (e *Engine) markUnfinished(ctx context.Context, run *model.Run, stageStatus
 		}
 		st.Status = stageStatus
 		st.Reason = reason
-		now := time.Now()
 		st.FinishedAt = &now
-		changed = true
 		for j := range st.Tasks {
 			if !st.Tasks[j].Status.IsTerminal() {
 				st.Tasks[j].Status = stageStatus
@@ -181,10 +201,8 @@ func (e *Engine) markUnfinished(ctx context.Context, run *model.Run, stageStatus
 		}
 		e.appr.Cancel(run.ID, st.Name, reason)
 	}
-	if !changed {
-		return
-	}
-	now := time.Now()
+	// The run always converges to its final status, even when every stage
+	// was already terminal (otherwise it would stay "running" forever).
 	run.Status = finalStatus
 	run.Reason = reason
 	run.FinishedAt = &now
@@ -199,6 +217,9 @@ func (e *Engine) finish(ctx context.Context, run *model.Run, status model.Status
 	fresh, err := e.st.LoadRun(ctx, run.ID)
 	if err == nil {
 		run = fresh
+	}
+	if run.Status.IsTerminal() {
+		return
 	}
 	now := time.Now()
 	run.Status = status

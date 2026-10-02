@@ -60,11 +60,11 @@ func (m *Manager) Request(_ context.Context, runID, stageName string, rule *mode
 	defer m.mu.Unlock()
 	k := key(runID, stageName)
 	if existing, ok := m.live[k]; ok {
-		return existing.state, nil
+		return cloneState(existing.state), nil
 	}
 	req := &request{state: st, ch: make(chan struct{})}
 	m.live[k] = req
-	return st, nil
+	return cloneState(st), nil
 }
 
 // Adopt re-registers an approval request that already exists in persistent
@@ -80,7 +80,7 @@ func (m *Manager) Adopt(_ context.Context, runID, stageName string, st *model.Ap
 	if st == nil || st.Status != model.StatusPending {
 		return
 	}
-	m.live[k] = &request{state: st, ch: make(chan struct{})}
+	m.live[k] = &request{state: cloneState(st), ch: make(chan struct{})}
 }
 
 // Peek returns the current state of a registered request without blocking.
